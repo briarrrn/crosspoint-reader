@@ -56,4 +56,11 @@ class KOReaderSyncClient {
    * Get human-readable error message.
    */
   static const char* errorString(Error error);
+
+  /**
+   * HTTP status code from the most recent request. Useful for diagnostics
+   * when errorString() alone is not enough to identify the failure.
+   * Set to -1 on network/connection errors.
+   */
+  static int lastHttpCode;
 };
