@@ -110,6 +110,71 @@ HttpResult doGet(const std::string& url) {
   return result;
 }
 
+HttpResult doPost(const std::string& url, const std::string& body) {
+  HttpResult result;
+
+  esp_http_client_config_t config = {};
+  config.url = url.c_str();
+  config.crt_bundle_attach = esp_crt_bundle_attach;
+  config.buffer_size = TLS_BUFFER_SIZE;
+  config.buffer_size_tx = TLS_BUFFER_SIZE;
+  config.method = HTTP_METHOD_POST;
+
+  esp_http_client_handle_t client = esp_http_client_init(&config);
+  if (!client) {
+    LOG_ERR("KOSync", "Failed to create HTTP client");
+    return result;
+  }
+
+  if (!setAuthHeaders(client)) {
+    esp_http_client_cleanup(client);
+    return result;
+  }
+
+  if (esp_http_client_set_header(client, "Content-Type", "application/json") != ESP_OK) {
+    LOG_ERR("KOSync", "Failed to set Content-Type header");
+    esp_http_client_cleanup(client);
+    return result;
+  }
+
+  const esp_err_t err = esp_http_client_open(client, static_cast<int>(body.size()));
+  if (err != ESP_OK) {
+    LOG_ERR("KOSync", "HTTP open failed: 0x%x", err);
+    esp_http_client_cleanup(client);
+    return result;
+  }
+
+  if (body.size() > 0) {
+    const int written = esp_http_client_write(client, body.c_str(), static_cast<int>(body.size()));
+    if (written < 0) {
+      LOG_ERR("KOSync", "HTTP write failed");
+      esp_http_client_close(client);
+      esp_http_client_cleanup(client);
+      return result;
+    }
+  }
+
+  const int64_t contentLength = esp_http_client_fetch_headers(client);
+  result.statusCode = esp_http_client_get_status_code(client);
+
+  if (contentLength > 0 && contentLength <= MAX_RESPONSE_SIZE) {
+    result.body.resize(static_cast<size_t>(contentLength));
+    esp_http_client_read(client, &result.body[0], static_cast<int>(contentLength));
+  } else if (contentLength < 0) {
+    char buf[128];
+    int bytesRead;
+    while ((bytesRead = esp_http_client_read(client, buf, sizeof(buf))) > 0) {
+      if (result.body.size() + static_cast<size_t>(bytesRead) < MAX_RESPONSE_SIZE) {
+        result.body.append(buf, static_cast<size_t>(bytesRead));
+      }
+    }
+  }
+
+  esp_http_client_close(client);
+  esp_http_client_cleanup(client);
+  return result;
+}
+
 HttpResult doPut(const std::string& url, const std::string& body) {
   HttpResult result;
 
@@ -256,46 +321,30 @@ KOReaderSyncClient::Error KOReaderSyncClient::registerUser() {
     return NO_CREDENTIALS;
   }
 
-  std::string url = KOREADER_STORE.getBaseUrl() + "/users/create";
+  const std::string url = KOREADER_STORE.getBaseUrl() + "/users/create";
   LOG_DBG("KOSync", "Registering user: %s", url.c_str());
 
-  HTTPClient http;
-  std::unique_ptr<WiFiClientSecure> secureClient;
-  WiFiClient plainClient;
-
-  if (isHttpsUrl(url)) {
-    secureClient.reset(new WiFiClientSecure);
-    secureClient->setInsecure();
-    http.begin(*secureClient, url.c_str());
-  } else {
-    http.begin(plainClient, url.c_str());
-  }
-  addAuthHeaders(http);
-  http.addHeader("Content-Type", "application/json");
-
   // POST with empty body; credentials are sent via auth headers
-  const int httpCode = http.POST("");
-  const String responseBody = http.getString();
-  http.end();
+  const auto response = doPost(url, "");
+  lastHttpCode = response.statusCode;
+  LOG_DBG("KOSync", "Register response: %d", response.statusCode);
 
-  LOG_DBG("KOSync", "Register response: %d", httpCode);
-
-  if (httpCode == 201) {
-    return OK;
-  } else if (httpCode == 200 || httpCode == 409) {
+  if (response.statusCode == 201) return OK;
+  if (response.statusCode == 200 || response.statusCode == 409) {
     // 200: korrosync returns 200 for existing user
     // 409: standard conflict response for duplicate user
     return USER_EXISTS;
-  } else if (httpCode == 402) {
+  }
+  if (response.statusCode == 402) {
     // Some server variants return 402 for either "user exists" or "registration disabled".
     // Disambiguate by inspecting the response body.
-    if (responseBody.indexOf("disabled") >= 0 || responseBody.indexOf("not allowed") >= 0) {
+    if (response.body.find("disabled") != std::string::npos ||
+        response.body.find("not allowed") != std::string::npos) {
       return REGISTRATION_DISABLED;
     }
     return USER_EXISTS;
-  } else if (httpCode < 0) {
-    return NETWORK_ERROR;
   }
+  if (response.statusCode < 0) return NETWORK_ERROR;
   return SERVER_ERROR;
 }
 
