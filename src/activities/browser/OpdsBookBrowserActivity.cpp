@@ -16,6 +16,7 @@
 #include "util/BookCacheUtils.h"
 #include "util/StringUtils.h"
 #include "util/UrlUtils.h"
+#include <HalStorage.h>
 
 namespace {
 constexpr int PAGE_ITEMS = 23;
@@ -269,8 +270,22 @@ void OpdsBookBrowserActivity::downloadBook(const OpdsEntry& book) {
   // Build full download URL relative to the current feed, not the root server URL
   const std::string feedUrl = UrlUtils::buildUrl(server.url, currentPath);
   std::string downloadUrl = UrlUtils::buildUrl(feedUrl, book.href);
-  std::string filename =
-      "/" + StringUtils::sanitizeFilename((book.author.empty() ? "" : book.author + " - ") + book.title) + ".epub";
+  const std::string sanitizedFile =
+      StringUtils::sanitizeFilename((book.author.empty() ? "" : book.author + " - ") + book.title);
+
+  // If the book belongs to a series, place it in a subfolder named after the series.
+  // Otherwise drop it into the SD root.
+  std::string filename;
+  if (!book.series.empty()) {
+    const std::string seriesDir = "/" + StringUtils::sanitizeFilename(book.series);
+    if (!Storage.ensureDirectoryExists(seriesDir.c_str())) {
+      LOG_ERR("OPDS", "Failed to create series directory: %s", seriesDir.c_str());
+    }
+    filename = seriesDir + "/" + sanitizedFile + ".epub";
+  } else {
+    filename = "/" + sanitizedFile + ".epub";
+  }
+
   LOG_DBG("OPDS", "Downloading: %s -> %s", downloadUrl.c_str(), filename.c_str());
 
   const auto result = HttpDownloader::downloadToFile(

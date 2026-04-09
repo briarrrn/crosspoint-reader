@@ -69,7 +69,7 @@ void OpdsParser::clear() {
   prevPageUrl.clear();
   currentEntry = OpdsEntry{};
   currentText.clear();
-  inEntry = inTitle = inAuthor = inAuthorName = inId = false;
+  inEntry = inTitle = inAuthor = inAuthorName = inId = inSeries = false;
 }
 
 std::vector<OpdsEntry> OpdsParser::getBooks() const {
@@ -149,6 +149,10 @@ void XMLCALL OpdsParser::startElement(void* userData, const XML_Char* name, cons
   } else if (strcmp(name, "id") == 0 || strstr(name, ":id") != nullptr) {
     self->inId = true;
     self->currentText.clear();
+  } else if (strstr(name, "calibre:series") != nullptr) {
+    // Calibre series extension: <calibre:series>
+    self->inSeries = true;
+    self->currentText.clear();
   }
 }
 
@@ -172,13 +176,17 @@ void XMLCALL OpdsParser::endElement(void* userData, const XML_Char* name) {
     } else if (strcmp(name, "id") == 0 || strstr(name, ":id") != nullptr) {
       if (self->inId) self->currentEntry.id = self->currentText;
       self->inId = false;
+    } else if (strstr(name, "calibre:series") != nullptr) {
+      // Calibre series extension: <calibre:series>
+      if (self->inSeries) self->currentEntry.series = self->currentText;
+      self->inSeries = false;
     }
   }
 }
 
 void XMLCALL OpdsParser::characterData(void* userData, const XML_Char* s, const int len) {
   auto* self = static_cast<OpdsParser*>(userData);
-  if (self->inTitle || self->inAuthorName || self->inId) {
+  if (self->inTitle || self->inAuthorName || self->inId || self->inSeries) {
     self->currentText.append(s, len);
   }
 }
