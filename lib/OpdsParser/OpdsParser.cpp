@@ -85,6 +85,7 @@ void OpdsParser::clear() {
   inAuthor = false;
   inAuthorName = false;
   inId = false;
+  inSeries = false;
 }
 
 std::vector<OpdsEntry> OpdsParser::getBooks() const {
@@ -141,6 +142,13 @@ void XMLCALL OpdsParser::startElement(void* userData, const XML_Char* name, cons
   // Check for id element
   if (strcmp(name, "id") == 0 || strstr(name, ":id") != nullptr) {
     self->inId = true;
+    self->currentText.clear();
+    return;
+  }
+
+  // Check for series element (Calibre extension: <calibre:series>)
+  if (strstr(name, "calibre:series") != nullptr) {
+    self->inSeries = true;
     self->currentText.clear();
     return;
   }
@@ -218,13 +226,22 @@ void XMLCALL OpdsParser::endElement(void* userData, const XML_Char* name) {
     self->inId = false;
     return;
   }
+
+  // Check for series end (Calibre extension: <calibre:series>)
+  if (strstr(name, "calibre:series") != nullptr) {
+    if (self->inSeries) {
+      self->currentEntry.series = self->currentText;
+    }
+    self->inSeries = false;
+    return;
+  }
 }
 
 void XMLCALL OpdsParser::characterData(void* userData, const XML_Char* s, const int len) {
   auto* self = static_cast<OpdsParser*>(userData);
 
   // Only accumulate text when in a text element
-  if (self->inTitle || self->inAuthorName || self->inId) {
+  if (self->inTitle || self->inAuthorName || self->inId || self->inSeries) {
     self->currentText.append(s, len);
   }
 }

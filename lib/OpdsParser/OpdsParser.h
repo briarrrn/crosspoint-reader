@@ -20,6 +20,7 @@ struct OpdsEntry {
   OpdsEntryType type = OpdsEntryType::NAVIGATION;
   std::string title;
   std::string author;  // Only for books
+  std::string series;  // Only for books (Calibre series extension, if present)
   std::string href;    // Navigation URL or epub download URL
   std::string id;
 };
@@ -99,6 +100,7 @@ class OpdsParser final : public Print {
   bool inAuthor = false;
   bool inAuthorName = false;
   bool inId = false;
+  bool inSeries = false;
 
   bool errorOccured = false;
 };

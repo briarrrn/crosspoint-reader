@@ -15,6 +15,7 @@
 #include "network/HttpDownloader.h"
 #include "util/StringUtils.h"
 #include "util/UrlUtils.h"
+#include <HalStorage.h>
 
 namespace {
 constexpr int PAGE_ITEMS = 23;
@@ -321,7 +322,20 @@ void OpdsBookBrowserActivity::downloadBook(const OpdsEntry& book) {
   if (!book.author.empty()) {
     baseName += " - " + book.author;
   }
-  std::string filename = "/" + StringUtils::sanitizeFilename(baseName) + ".epub";
+  const std::string sanitizedFile = StringUtils::sanitizeFilename(baseName);
+
+  // If the book belongs to a series, place it in a subfolder named after the series.
+  // Otherwise drop it into the SD root.
+  std::string filename;
+  if (!book.series.empty()) {
+    const std::string seriesDir = "/" + StringUtils::sanitizeFilename(book.series);
+    if (!Storage.ensureDirectoryExists(seriesDir.c_str())) {
+      LOG_ERR("OPDS", "Failed to create series directory: %s", seriesDir.c_str());
+    }
+    filename = seriesDir + "/" + sanitizedFile + ".epub";
+  } else {
+    filename = "/" + sanitizedFile + ".epub";
+  }
 
   LOG_DBG("OPDS", "Downloading: %s -> %s", downloadUrl.c_str(), filename.c_str());
 
