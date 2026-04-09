@@ -1,6 +1,7 @@
 #include "OpdsBookBrowserActivity.h"
 
 #include <GfxRenderer.h>
+#include <HalStorage.h>
 #include <I18n.h>
 #include <Logging.h>
 #include <OpdsStream.h>
@@ -16,7 +17,6 @@
 #include "util/BookCacheUtils.h"
 #include "util/StringUtils.h"
 #include "util/UrlUtils.h"
-#include <HalStorage.h>
 
 namespace {
 constexpr int PAGE_ITEMS = 23;
