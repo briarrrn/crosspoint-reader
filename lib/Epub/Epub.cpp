@@ -140,6 +140,34 @@ bool Epub::parseContentOpf(BookMetadataCache::BookMetadata& bookMetadata) {
   return true;
 }
 
+std::string Epub::readSeriesFromOpf() {
+  // Find the OPF file path (also populates contentBasePath)
+  std::string contentOpfFilePath;
+  if (!findContentOpfFile(&contentOpfFilePath)) {
+    return {};
+  }
+
+  size_t contentOpfSize;
+  if (!getItemSize(contentOpfFilePath, &contentOpfSize)) {
+    return {};
+  }
+
+  // bookMetadataCache is uninitialised here (nullptr) — safe because metadataOnly=true
+  // skips all manifest/spine/guide processing that would use the cache pointer.
+  ContentOpfParser opfParser(getCachePath(), getBasePath(), contentOpfSize, nullptr);
+  opfParser.metadataOnly = true;
+
+  if (!opfParser.setup()) {
+    return {};
+  }
+
+  if (!readItemContentsToStream(contentOpfFilePath, opfParser, 1024)) {
+    return {};
+  }
+
+  return opfParser.series;
+}
+
 bool Epub::parseTocNcxFile() const {
   // the ncx file should have been specified in the content.opf file
   if (tocNcxItem.empty()) {

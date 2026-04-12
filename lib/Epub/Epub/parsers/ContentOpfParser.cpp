@@ -118,6 +118,7 @@ void XMLCALL ContentOpfParser::startElement(void* userData, const XML_Char* name
   }
 
   if (self->state == IN_PACKAGE && (strcmp(name, "manifest") == 0 || strcmp(name, "opf:manifest") == 0)) {
+    if (self->metadataOnly) return;
     self->state = IN_MANIFEST;
     if (!Storage.openFileForWrite("COF", self->cachePath + itemCacheFile, self->tempItemStore)) {
       LOG_ERR("COF", "Couldn't open temp items file for writing. This is probably going to be a fatal error.");
@@ -126,6 +127,7 @@ void XMLCALL ContentOpfParser::startElement(void* userData, const XML_Char* name
   }
 
   if (self->state == IN_PACKAGE && (strcmp(name, "spine") == 0 || strcmp(name, "opf:spine") == 0)) {
+    if (self->metadataOnly) return;
     self->state = IN_SPINE;
     if (!Storage.openFileForRead("COF", self->cachePath + itemCacheFile, self->tempItemStore)) {
       LOG_ERR("COF", "Couldn't open temp items file for reading. This is probably going to be a fatal error.");
@@ -143,6 +145,7 @@ void XMLCALL ContentOpfParser::startElement(void* userData, const XML_Char* name
   }
 
   if (self->state == IN_PACKAGE && (strcmp(name, "guide") == 0 || strcmp(name, "opf:guide") == 0)) {
+    if (self->metadataOnly) return;
     self->state = IN_GUIDE;
     // TODO Remove print
     LOG_DBG("COF", "Entering guide state.");
@@ -155,6 +158,7 @@ void XMLCALL ContentOpfParser::startElement(void* userData, const XML_Char* name
   if (self->state == IN_METADATA && (strcmp(name, "meta") == 0 || strcmp(name, "opf:meta") == 0)) {
     bool isCover = false;
     std::string coverItemId;
+    const char* property = nullptr;
 
     for (int i = 0; atts[i]; i += 2) {
       if (strcmp(atts[i], "name") == 0 && strcmp(atts[i + 1], "cover") == 0) {
@@ -162,10 +166,28 @@ void XMLCALL ContentOpfParser::startElement(void* userData, const XML_Char* name
       } else if (strcmp(atts[i], "content") == 0) {
         coverItemId = atts[i + 1];
       }
+      // EPUB 2 Calibre extension: <meta name="calibre:series" content="Series Name"/>
+      if (strcmp(atts[i], "name") == 0 && strcmp(atts[i + 1], "calibre:series") == 0) {
+        // Find the content attribute in the same element
+        for (int j = 0; atts[j]; j += 2) {
+          if (strcmp(atts[j], "content") == 0) {
+            self->series = atts[j + 1];
+            break;
+          }
+        }
+      }
+      // EPUB 3: <meta property="belongs-to-collection">Series Name</meta>
+      if (strcmp(atts[i], "property") == 0 && strcmp(atts[i + 1], "belongs-to-collection") == 0) {
+        property = atts[i + 1];
+      }
     }
 
     if (isCover) {
       self->coverItemId = coverItemId;
+    }
+    // Only use EPUB3 character-data series if EPUB2 attribute didn't already set it
+    if (property != nullptr && self->series.empty()) {
+      self->state = IN_BOOK_SERIES;
     }
     return;
   }
@@ -338,6 +360,11 @@ void XMLCALL ContentOpfParser::characterData(void* userData, const XML_Char* s, 
     self->language.append(s, len);
     return;
   }
+
+  if (self->state == IN_BOOK_SERIES) {
+    self->series.append(s, len);
+    return;
+  }
 }
 
 void XMLCALL ContentOpfParser::endElement(void* userData, const XML_Char* name) {
@@ -373,6 +400,11 @@ void XMLCALL ContentOpfParser::endElement(void* userData, const XML_Char* name) 
   }
 
   if (self->state == IN_BOOK_LANGUAGE && strcmp(name, "dc:language") == 0) {
+    self->state = IN_METADATA;
+    return;
+  }
+
+  if (self->state == IN_BOOK_SERIES && (strcmp(name, "meta") == 0 || strcmp(name, "opf:meta") == 0)) {
     self->state = IN_METADATA;
     return;
   }

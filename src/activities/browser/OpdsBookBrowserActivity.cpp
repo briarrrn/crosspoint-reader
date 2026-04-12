@@ -324,18 +324,9 @@ void OpdsBookBrowserActivity::downloadBook(const OpdsEntry& book) {
   }
   const std::string sanitizedFile = StringUtils::sanitizeFilename(baseName);
 
-  // If the book belongs to a series, place it in a subfolder named after the series.
-  // Otherwise drop it into the SD root.
-  std::string filename;
-  if (!book.series.empty()) {
-    const std::string seriesDir = "/" + StringUtils::sanitizeFilename(book.series);
-    if (!Storage.ensureDirectoryExists(seriesDir.c_str())) {
-      LOG_ERR("OPDS", "Failed to create series directory: %s", seriesDir.c_str());
-    }
-    filename = seriesDir + "/" + sanitizedFile + ".epub";
-  } else {
-    filename = "/" + sanitizedFile + ".epub";
-  }
+  // Always download to root first; series folder placement happens after download
+  // using metadata extracted directly from the EPUB file.
+  const std::string filename = "/" + sanitizedFile + ".epub";
 
   LOG_DBG("OPDS", "Downloading: %s -> %s", downloadUrl.c_str(), filename.c_str());
 
@@ -349,10 +340,32 @@ void OpdsBookBrowserActivity::downloadBook(const OpdsEntry& book) {
   if (result == HttpDownloader::OK) {
     LOG_DBG("OPDS", "Download complete: %s", filename.c_str());
 
-    // Invalidate any existing cache for this file to prevent stale metadata issues
-    Epub epub(filename, "/.crosspoint");
-    epub.clearCache();
-    LOG_DBG("OPDS", "Cleared cache for: %s", filename.c_str());
+    // Extract series from the EPUB OPF metadata and move into a series subfolder.
+    // This works regardless of what the OPDS server exposes.
+    std::string finalFilename = filename;
+    {
+      Epub epub(filename, "/.crosspoint");
+      const std::string series = epub.readSeriesFromOpf();
+      if (!series.empty()) {
+        const std::string seriesDir = "/" + StringUtils::sanitizeFilename(series);
+        if (Storage.ensureDirectoryExists(seriesDir.c_str())) {
+          const std::string seriesFilename = seriesDir + "/" + sanitizedFile + ".epub";
+          if (Storage.rename(filename.c_str(), seriesFilename.c_str())) {
+            finalFilename = seriesFilename;
+            LOG_DBG("OPDS", "Moved to series folder: %s", finalFilename.c_str());
+          } else {
+            LOG_ERR("OPDS", "Failed to move file to series folder, leaving at root");
+          }
+        } else {
+          LOG_ERR("OPDS", "Failed to create series directory: %s", seriesDir.c_str());
+        }
+      }
+    }
+
+    // Invalidate any existing cache for the final file path
+    Epub finalEpub(finalFilename, "/.crosspoint");
+    finalEpub.clearCache();
+    LOG_DBG("OPDS", "Cleared cache for: %s", finalFilename.c_str());
 
     state = BrowserState::BROWSING;
     requestUpdate();
