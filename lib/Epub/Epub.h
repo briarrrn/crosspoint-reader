@@ -44,6 +44,9 @@ class Epub {
   ~Epub() = default;
   std::string& getBasePath() { return contentBasePath; }
   bool load(bool buildIfMissing = true, bool skipLoadingCss = false);
+  // Lightweight: reads only the OPF metadata section to extract series name.
+  // Does not build or touch any SD cache. Returns empty string if not found or on error.
+  std::string readSeriesFromOpf();
   bool clearCache() const;
   void setupCacheDir() const;
   const std::string& getCachePath() const;
