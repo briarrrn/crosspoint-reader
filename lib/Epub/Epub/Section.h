@@ -42,4 +42,13 @@ class Section {
 
   // Look up the page number for an anchor id from the section cache file.
   std::optional<uint16_t> getPageForAnchor(const std::string& anchor) const;
+
+  // Look up the page number for a synthetic paragraph index from XPath p[N].
+  std::optional<uint16_t> getPageForParagraphIndex(uint16_t pIndex) const;
+
+  // Look up the page number for a running list-item index from the li LUT.
+  std::optional<uint16_t> getPageForListItemIndex(uint16_t liIndex) const;
+
+  // Look up the synthetic paragraph index for the given rendered page.
+  std::optional<uint16_t> getParagraphIndexForPage(uint16_t page) const;
 };

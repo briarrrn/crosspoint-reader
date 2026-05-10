@@ -82,7 +82,6 @@ bool KOReaderCredentialStore::loadFromBinaryFile() {
   serialization::readPod(file, version);
   if (version != KOREADER_FILE_VERSION) {
     LOG_DBG("KRS", "Unknown file version: %u", version);
-    file.close();
     return false;
   }
 
@@ -113,7 +112,6 @@ bool KOReaderCredentialStore::loadFromBinaryFile() {
     matchMethod = DocumentMatchMethod::FILENAME;
   }
 
-  file.close();
   LOG_DBG("KRS", "Loaded KOReader credentials from binary for user: %s", username.c_str());
   return true;
 }
@@ -154,19 +152,17 @@ void KOReaderCredentialStore::setServerUrl(const std::string& url) {
 
 std::string KOReaderCredentialStore::getBaseUrl() const {
   std::string url;
-
   if (serverUrl.empty()) {
     url = DEFAULT_SERVER_URL;
   } else if (serverUrl.find("://") == std::string::npos) {
-    // No protocol specified: assume plain HTTP (typical for local servers without SSL)
+    // Normalize URL: add http:// if no protocol specified (local servers typically don't have SSL)
     url = "http://" + serverUrl;
   } else {
     url = serverUrl;
   }
 
-  // Strip trailing slash to prevent double-slash in constructed API paths
-  // e.g. "http://host/" + "/users/auth" → "http://host//users/auth" (broken)
-  if (!url.empty() && url.back() == '/') {
+  // Strip trailing slashes to avoid double-slash in API paths
+  while (!url.empty() && url.back() == '/') {
     url.pop_back();
   }
 

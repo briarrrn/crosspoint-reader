@@ -2,9 +2,11 @@
 
 #include <ArduinoJson.h>
 #include <Logging.h>
+#include <base64.h>
 #include <esp_crt_bundle.h>
 #include <esp_http_client.h>
-#include <mbedtls/base64.h>
+
+#include <ctime>
 
 #include "KOReaderCredentialStore.h"
 
@@ -15,189 +17,155 @@ namespace {
 constexpr char DEVICE_NAME[] = "CrossPoint";
 constexpr char DEVICE_ID[] = "crosspoint-reader";
 
-// Use 2KB TLS buffers instead of Arduino's default 16KB RX + 16KB TX.
-// After WiFi init the ESP32-C3 has ~46KB free heap; the 32KB default leaves
-// insufficient headroom for the TLS handshake to complete reliably.
-// KOSync payloads are small (<1KB), so 2KB buffers are sufficient.
-constexpr int TLS_BUFFER_SIZE = 2048;
-constexpr int MAX_RESPONSE_SIZE = 1024;
+// Small TLS buffers to fit in ESP32-C3's limited heap (~46KB free after WiFi).
+// KOSync payloads are tiny JSON (<1KB), so 2KB buffers are sufficient.
+// Default 16KB buffers cause OOM during TLS handshake.
+constexpr int HTTP_BUF_SIZE = 2048;
 
-// Build a Base64-encoded HTTP Basic Auth header value.
-// Credentials buffer: max 64 (user) + 1 (:) + 64 (pass) + null = 130 bytes.
-// Base64 output: ceil(130/3)*4 + 1 = 177 bytes — fits on stack.
-std::string buildBasicAuthHeader() {
-  const std::string credentials = KOREADER_STORE.getUsername() + ":" + KOREADER_STORE.getPassword();
-  const auto* src = reinterpret_cast<const unsigned char*>(credentials.c_str());
-  const size_t srcLen = credentials.size();
+// Cloudflare tunnels send a 3-cert Google Trust Services chain. During the TLS handshake
+// mbedTLS makes many small allocations that collectively consume ~48KB of heap. With only
+// ~50KB free after WiFi connects, the session drove min-free-ever down to 2600 bytes before
+// failing with MBEDTLS_ERR_X509_ALLOC_FAILED (-0x2880). Check total free heap (not max
+// contiguous block) because the failure mode is aggregate exhaustion, not one large alloc.
+constexpr uint32_t MIN_HEAP_FOR_TLS = 55000;
 
-  // First call with nullptr to obtain the required output length (includes null terminator).
-  size_t outLen = 0;
-  mbedtls_base64_encode(nullptr, 0, &outLen, src, srcLen);
+// Response buffer for reading HTTP body
+struct ResponseBuffer {
+  char* data = nullptr;
+  int len = 0;
+  int capacity = 0;
 
-  std::string encoded(outLen, '\0');
-  mbedtls_base64_encode(reinterpret_cast<unsigned char*>(&encoded[0]), outLen, &outLen, src, srcLen);
+  ~ResponseBuffer() { free(data); }
 
-  // mbedtls writes a null terminator and includes it in outLen — trim it.
-  if (!encoded.empty() && encoded.back() == '\0') {
-    encoded.pop_back();
+  bool ensure(int size) {
+    if (size <= capacity) return true;
+    char* newData = (char*)realloc(data, size);
+    if (!newData) return false;
+    data = newData;
+    capacity = size;
+    return true;
   }
-  return "Basic " + encoded;
-}
-
-bool setAuthHeaders(esp_http_client_handle_t client) {
-  const std::string authHeader = buildBasicAuthHeader();
-  if (esp_http_client_set_header(client, "Accept", "application/vnd.koreader.v1+json") != ESP_OK ||
-      esp_http_client_set_header(client, "x-auth-user", KOREADER_STORE.getUsername().c_str()) != ESP_OK ||
-      esp_http_client_set_header(client, "x-auth-key", KOREADER_STORE.getMd5Password().c_str()) != ESP_OK ||
-      esp_http_client_set_header(client, "Authorization", authHeader.c_str()) != ESP_OK) {
-    LOG_ERR("KOSync", "Failed to set auth headers");
-    return false;
-  }
-  return true;
-}
-
-struct HttpResult {
-  int statusCode = -1;
-  std::string body;
 };
 
-HttpResult doGet(const std::string& url) {
-  HttpResult result;
-
-  esp_http_client_config_t config = {};
-  config.url = url.c_str();
-  config.crt_bundle_attach = esp_crt_bundle_attach;
-  config.buffer_size = TLS_BUFFER_SIZE;
-  config.buffer_size_tx = TLS_BUFFER_SIZE;
-
-  esp_http_client_handle_t client = esp_http_client_init(&config);
-  if (!client) {
-    LOG_ERR("KOSync", "Failed to create HTTP client");
-    return result;
-  }
-
-  if (!setAuthHeaders(client)) {
-    esp_http_client_cleanup(client);
-    return result;
-  }
-
-  const esp_err_t err = esp_http_client_open(client, 0);
-  if (err != ESP_OK) {
-    LOG_ERR("KOSync", "HTTP open failed: 0x%x", err);
-    esp_http_client_cleanup(client);
-    return result;
-  }
-
-  const int64_t contentLength = esp_http_client_fetch_headers(client);
-  result.statusCode = esp_http_client_get_status_code(client);
-
-  if (contentLength > 0 && contentLength <= MAX_RESPONSE_SIZE) {
-    result.body.resize(static_cast<size_t>(contentLength));
-    esp_http_client_read(client, &result.body[0], static_cast<int>(contentLength));
-  } else if (contentLength < 0) {
-    // Chunked or no Content-Length — read until the client signals completion.
-    char buf[128];
-    int bytesRead;
-    while ((bytesRead = esp_http_client_read(client, buf, sizeof(buf))) > 0) {
-      if (result.body.size() + static_cast<size_t>(bytesRead) < MAX_RESPONSE_SIZE) {
-        result.body.append(buf, static_cast<size_t>(bytesRead));
-      }
+// HTTP event handler to collect response body
+esp_err_t httpEventHandler(esp_http_client_event_t* evt) {
+  auto* buf = static_cast<ResponseBuffer*>(evt->user_data);
+  if (evt->event_id == HTTP_EVENT_ON_DATA && buf) {
+    if (buf->ensure(buf->len + evt->data_len + 1)) {
+      memcpy(buf->data + buf->len, evt->data, evt->data_len);
+      buf->len += evt->data_len;
+      buf->data[buf->len] = '\0';
+    } else {
+      LOG_ERR("KOSync", "Response buffer allocation failed (%d bytes)", evt->data_len);
     }
   }
-
-  esp_http_client_close(client);
-  esp_http_client_cleanup(client);
-  return result;
+  return ESP_OK;
 }
 
-HttpResult doPut(const std::string& url, const std::string& body) {
-  HttpResult result;
-
+// Create configured esp_http_client with small TLS buffers
+esp_http_client_handle_t createClient(const char* url, ResponseBuffer* buf,
+                                      esp_http_client_method_t method = HTTP_METHOD_GET) {
   esp_http_client_config_t config = {};
-  config.url = url.c_str();
+  config.url = url;
+  config.event_handler = httpEventHandler;
+  config.user_data = buf;
+  config.method = method;
+  config.timeout_ms = 15000;
+  config.buffer_size = HTTP_BUF_SIZE;
+  config.buffer_size_tx = HTTP_BUF_SIZE;
   config.crt_bundle_attach = esp_crt_bundle_attach;
-  config.buffer_size = TLS_BUFFER_SIZE;
-  config.buffer_size_tx = TLS_BUFFER_SIZE;
-  config.method = HTTP_METHOD_PUT;
 
   esp_http_client_handle_t client = esp_http_client_init(&config);
-  if (!client) {
-    LOG_ERR("KOSync", "Failed to create HTTP client");
-    return result;
-  }
+  if (!client) return nullptr;
 
-  if (!setAuthHeaders(client)) {
+  // KOSync auth headers
+  if (esp_http_client_set_header(client, "Accept", "application/vnd.koreader.v1+json") != ESP_OK ||
+      esp_http_client_set_header(client, "x-auth-user", KOREADER_STORE.getUsername().c_str()) != ESP_OK ||
+      esp_http_client_set_header(client, "x-auth-key", KOREADER_STORE.getMd5Password().c_str()) != ESP_OK) {
+    LOG_ERR("KOSync", "Failed to set auth headers");
     esp_http_client_cleanup(client);
-    return result;
+    return nullptr;
   }
 
-  if (esp_http_client_set_header(client, "Content-Type", "application/json") != ESP_OK) {
-    LOG_ERR("KOSync", "Failed to set Content-Type header");
+  // HTTP Basic Auth for Calibre-Web-Automated compatibility
+  std::string credentials = KOREADER_STORE.getUsername() + ":" + KOREADER_STORE.getPassword();
+  String encoded = base64::encode(reinterpret_cast<const uint8_t*>(credentials.data()), credentials.size());
+  std::string authHeader = "Basic " + std::string(encoded.c_str());
+  if (esp_http_client_set_header(client, "Authorization", authHeader.c_str()) != ESP_OK) {
+    LOG_ERR("KOSync", "Failed to set Authorization header");
     esp_http_client_cleanup(client);
-    return result;
+    return nullptr;
   }
 
-  const esp_err_t err = esp_http_client_open(client, static_cast<int>(body.size()));
-  if (err != ESP_OK) {
-    LOG_ERR("KOSync", "HTTP open failed: 0x%x", err);
-    esp_http_client_cleanup(client);
-    return result;
-  }
-
-  const int written = esp_http_client_write(client, body.c_str(), static_cast<int>(body.size()));
-  if (written < 0) {
-    LOG_ERR("KOSync", "HTTP write failed");
-    esp_http_client_close(client);
-    esp_http_client_cleanup(client);
-    return result;
-  }
-
-  esp_http_client_fetch_headers(client);
-  result.statusCode = esp_http_client_get_status_code(client);
-
-  esp_http_client_close(client);
-  esp_http_client_cleanup(client);
-  return result;
+  return client;
 }
 }  // namespace
 
 KOReaderSyncClient::Error KOReaderSyncClient::authenticate() {
+  lastHttpCode = 0;
   if (!KOREADER_STORE.hasCredentials()) {
     LOG_DBG("KOSync", "No credentials configured");
     return NO_CREDENTIALS;
   }
 
-  const std::string url = KOREADER_STORE.getBaseUrl() + "/users/auth";
-  LOG_DBG("KOSync", "Authenticating: %s", url.c_str());
-  LOG_DBG("KOSync", "Free heap before auth: %d", ESP.getFreeHeap());
+  std::string url = KOREADER_STORE.getBaseUrl() + "/users/auth";
+  const uint32_t freeHeap = ESP.getFreeHeap();
+  LOG_DBG("KOSync", "Authenticating: %s (heap: %u)", url.c_str(), (unsigned)freeHeap);
+  if (freeHeap < MIN_HEAP_FOR_TLS) {
+    LOG_ERR("KOSync", "Insufficient heap for TLS handshake: %u bytes free (need %u)", freeHeap, MIN_HEAP_FOR_TLS);
+    return LOW_MEMORY;
+  }
 
-  const auto response = doGet(url);
-  lastHttpCode = response.statusCode;
-  LOG_DBG("KOSync", "Auth response: %d", response.statusCode);
+  ResponseBuffer buf;
+  esp_http_client_handle_t client = createClient(url.c_str(), &buf);
+  if (!client) return NETWORK_ERROR;
 
-  if (response.statusCode == 200) return OK;
-  if (response.statusCode == 401) return AUTH_FAILED;
-  if (response.statusCode < 0) return NETWORK_ERROR;
+  esp_err_t err = esp_http_client_perform(client);
+  const int httpCode = esp_http_client_get_status_code(client);
+  lastHttpCode = httpCode;
+  esp_http_client_cleanup(client);
+
+  LOG_DBG("KOSync", "Auth response: %d (err: %d)", httpCode, err);
+
+  if (err != ESP_OK) return NETWORK_ERROR;
+  if (httpCode == 200) return OK;
+  if (httpCode == 401) return AUTH_FAILED;
   return SERVER_ERROR;
 }
 
 KOReaderSyncClient::Error KOReaderSyncClient::getProgress(const std::string& documentHash,
                                                           KOReaderProgress& outProgress) {
+  lastHttpCode = 0;
   if (!KOREADER_STORE.hasCredentials()) {
     LOG_DBG("KOSync", "No credentials configured");
     return NO_CREDENTIALS;
   }
 
-  const std::string url = KOREADER_STORE.getBaseUrl() + "/syncs/progress/" + documentHash;
-  LOG_DBG("KOSync", "Getting progress: %s", url.c_str());
+  std::string url = KOREADER_STORE.getBaseUrl() + "/syncs/progress/" + documentHash;
+  const uint32_t freeHeap = ESP.getFreeHeap();
+  LOG_DBG("KOSync", "Getting progress: %s (heap: %u)", url.c_str(), (unsigned)freeHeap);
+  if (freeHeap < MIN_HEAP_FOR_TLS) {
+    LOG_ERR("KOSync", "Insufficient heap for TLS handshake: %u bytes free (need %u)", freeHeap, MIN_HEAP_FOR_TLS);
+    return LOW_MEMORY;
+  }
 
-  const auto response = doGet(url);
-  lastHttpCode = response.statusCode;
-  LOG_DBG("KOSync", "Get progress response: %d", response.statusCode);
+  ResponseBuffer buf;
+  esp_http_client_handle_t client = createClient(url.c_str(), &buf);
+  if (!client) return NETWORK_ERROR;
 
-  if (response.statusCode == 200) {
+  esp_err_t err = esp_http_client_perform(client);
+  const int httpCode = esp_http_client_get_status_code(client);
+  lastHttpCode = httpCode;
+  esp_http_client_cleanup(client);
+
+  LOG_DBG("KOSync", "Get progress response: %d (err: %d)", httpCode, err);
+
+  if (err != ESP_OK) return NETWORK_ERROR;
+
+  if (httpCode == 200 && buf.data) {
     JsonDocument doc;
-    const DeserializationError error = deserializeJson(doc, response.body);
+    const DeserializationError error = deserializeJson(doc, buf.data);
+
     if (error) {
       LOG_ERR("KOSync", "JSON parse failed: %s", error.c_str());
       return JSON_ERROR;
@@ -214,21 +182,27 @@ KOReaderSyncClient::Error KOReaderSyncClient::getProgress(const std::string& doc
     return OK;
   }
 
-  if (response.statusCode == 401) return AUTH_FAILED;
-  if (response.statusCode == 404) return NOT_FOUND;
-  if (response.statusCode < 0) return NETWORK_ERROR;
+  if (httpCode == 401) return AUTH_FAILED;
+  if (httpCode == 404) return NOT_FOUND;
   return SERVER_ERROR;
 }
 
 KOReaderSyncClient::Error KOReaderSyncClient::updateProgress(const KOReaderProgress& progress) {
+  lastHttpCode = 0;
   if (!KOREADER_STORE.hasCredentials()) {
     LOG_DBG("KOSync", "No credentials configured");
     return NO_CREDENTIALS;
   }
 
-  const std::string url = KOREADER_STORE.getBaseUrl() + "/syncs/progress";
-  LOG_DBG("KOSync", "Updating progress: %s", url.c_str());
+  std::string url = KOREADER_STORE.getBaseUrl() + "/syncs/progress";
+  const uint32_t freeHeap = ESP.getFreeHeap();
+  LOG_DBG("KOSync", "Updating progress: %s (heap: %u)", url.c_str(), (unsigned)freeHeap);
+  if (freeHeap < MIN_HEAP_FOR_TLS) {
+    LOG_ERR("KOSync", "Insufficient heap for TLS handshake: %u bytes free (need %u)", freeHeap, MIN_HEAP_FOR_TLS);
+    return LOW_MEMORY;
+  }
 
+  // Build JSON body
   JsonDocument doc;
   doc["document"] = progress.document;
   doc["progress"] = progress.progress;
@@ -238,15 +212,30 @@ KOReaderSyncClient::Error KOReaderSyncClient::updateProgress(const KOReaderProgr
 
   std::string body;
   serializeJson(doc, body);
+
   LOG_DBG("KOSync", "Request body: %s", body.c_str());
 
-  const auto response = doPut(url, body);
-  lastHttpCode = response.statusCode;
-  LOG_DBG("KOSync", "Update progress response: %d", response.statusCode);
+  ResponseBuffer buf;
+  esp_http_client_handle_t client = createClient(url.c_str(), &buf, HTTP_METHOD_PUT);
+  if (!client) return NETWORK_ERROR;
 
-  if (response.statusCode == 200 || response.statusCode == 202) return OK;
-  if (response.statusCode == 401) return AUTH_FAILED;
-  if (response.statusCode < 0) return NETWORK_ERROR;
+  if (esp_http_client_set_header(client, "Content-Type", "application/json") != ESP_OK ||
+      esp_http_client_set_post_field(client, body.c_str(), body.length()) != ESP_OK) {
+    LOG_ERR("KOSync", "Failed to set request body");
+    esp_http_client_cleanup(client);
+    return NETWORK_ERROR;
+  }
+
+  esp_err_t err = esp_http_client_perform(client);
+  const int httpCode = esp_http_client_get_status_code(client);
+  lastHttpCode = httpCode;
+  esp_http_client_cleanup(client);
+
+  LOG_DBG("KOSync", "Update progress response: %d (err: %d)", httpCode, err);
+
+  if (err != ESP_OK) return NETWORK_ERROR;
+  if (httpCode == 200 || httpCode == 202) return OK;
+  if (httpCode == 401) return AUTH_FAILED;
   return SERVER_ERROR;
 }
 
@@ -266,6 +255,8 @@ const char* KOReaderSyncClient::errorString(Error error) {
       return "JSON parse error";
     case NOT_FOUND:
       return "No progress found";
+    case LOW_MEMORY:
+      return "Not enough memory for sync — please retry";
     default:
       return "Unknown error";
   }
